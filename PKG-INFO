@@ -1,0 +1,18 @@
+Metadata-Version: 1.1
+Name: dds3x25
+Version: 0.1
+Summary: Hantek DDS3x25 Signal Generator Interface Library
+Home-page: UNKNOWN
+Author: Domas Jokubauskis
+Author-email: domas@jokubauskis.lt
+Author: Tymm Twillman
+Author-email: tymm@miselu.com
+License: 
+Description: Python library for interfacing with & controlling Hantek DDS3x25 signal generators.
+Platform: UNKNOWN
+Classifier: Development Status :: 3 - Alpha 
+Classifier: Programming Language :: Python
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)
+Requires: usb
+Provides: dds3x25

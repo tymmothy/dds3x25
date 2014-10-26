@@ -1,0 +1,2 @@
+# Hantek DDS-3X25 Arbitrary Waveform Generator
+ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5721", MODE="0660", GROUP="plugdev"
