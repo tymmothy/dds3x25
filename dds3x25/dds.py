@@ -2,43 +2,16 @@
 """
 This is an interface library for Hantek DDS-3X25 arbitrary waveform generator.
 
-What works:
-* (unreliable) waveform sending
-* clock divider setting
-* digital IO pins
-* frequency and pulse counter
-
-Requirements:
-https://pypi.python.org/pypi/libusb1 >=1.0.0 version
-
-Installation:
-Copy the folder to the Python library path or use it in current folder.
-
-NOTE: To use this interface as a regular user:
-Move 91-hantek_dds.rules to /etc/udev/rules.d/ and run 'service udev restart'.
-Reconnect the device. It should work without root rights.
-
 Licenced LGPL2+
 Copyright (C) 2013 Domas Jokubauskis (domas@jokubauskis.lt)
-
-Protocol reference: http://sigrok.org/wiki/Hantek_DDS-3X25
-Started by tymm on EEVblog Electronics Community Forum:
-http://www.eevblog.com/forum/chat/review-hantek-dds-3x25-anyone-own-one/msg290311/#msg290311
-Information for sync output correction:
-http://www.soasystem.com/eng/goltek/synch.htm
+Copyright (C) 2014 Tymm Twillman (tymmothy@gmail.com)
 """
-
-#TODO: make a system for waveform generation at a reliable frequency
-#TODO: save waveform to memory
-#TODO: test in Windows
 
 import usb.core
 import usb.util
 import struct
 import math
-
-
-PACKET_TYPE_CONFIGURE =       0xa0
+import collections
 
 
 class SamplePoint(object):
@@ -132,7 +105,29 @@ class PointCountPacket(object):
         return s
 
 
-def usb_configure(idVendor, idProduct, ep_directions):
+class ConfigurePacket(object):
+    PACKET_TYPE = 0xa0
+
+    def __init__(self, dds, reset_counter=False, reset_trigger=False):
+        b0 = 1 if dds._counter_mode else 0
+        b0 |= 2 if reset_counter else 0
+        b0 |= 4 if dds._oneshot else 0
+        b0 |= 8 if dds._ext_trigger == 1 else 0
+        b0 |= 16 if dds._ext_trigger is not None else 0
+        b0 |= 32 if reset_trigger else 0
+        self._b0 = b0
+
+        self._b1 = 1 if dds._programmable_output else 0
+
+        self._b2_3 = dds._digital_output
+        self._b4_5 = dds._clock_divider / 2
+
+    def __str__(self):
+        s = struct.pack('<B2BHH', ConfigurePacket.PACKET_TYPE, self._b0, self._b1, self._b2_3, self._b4_5)
+        return s
+
+
+def usb_configure(idVendor, idProduct):
     usb_dev = usb.core.find(idVendor=idVendor, idProduct=idProduct)
     if not usb_dev: raise ValueError('Device not found.')
 
@@ -151,7 +146,7 @@ def usb_configure(idVendor, idProduct, ep_directions):
 
     endpoints = []
 
-    for ep_direction in ep_directions:
+    for ep_direction in (usb.util.ENDPOINT_IN, usb.util.ENDPOINT_OUT):
         ep = usb.util.find_descriptor(
              intf,
              # match the first OUT endpoint
@@ -187,7 +182,7 @@ class DDS(object):
     USB_PID = 0x5721
 
     # Core DAC clock -> 200 MHz
-    DAC_CLOCK = 200e6
+    DAC_CLOCK = int(200e6)
 
     # Maximum DAC clock divider
     DAC_CLOCK_DIV_MAX = 131070
@@ -197,8 +192,6 @@ class DDS(object):
 
     NUM_DIGITAL_OUTPUTS = 12
     NUM_DIGITAL_INPUTS =   6
-
-    CONFIGURE_PACKET_TYPE = 0xa0
 
     def __init__(self, idVendor=USB_VID, idProduct=USB_PID, **kwargs):
         """Initialize a DDS instance and connect to the hardware.
@@ -222,15 +215,13 @@ class DDS(object):
         if kwargs.get('testing', False):
             return
 
-        # We want to set up an in endpoint and an out endpoint
-        usb_ep_directions = (usb.util.ENDPOINT_IN, usb.util.ENDPOINT_OUT)
-
-        self._in_ep, self._out_ep = usb_configure(idVendor, idProduct, usb_ep_directions)
-
-        self._write = lambda data: self._out_ep.write(data)
-        self._read = lambda: self._in_ep.read(self._in_ep.wMaxPacketSize)
+        self._in_ep, self._out_ep = usb_configure(idVendor, idProduct)
 
         self.configure(**kwargs)
+
+    def transfer(self, data):
+        self._out_ep.write(data)
+        return self._in_ep.read(self._in_ep.wMaxPacketSize)
 
     def configure(self, **kwargs):
         """Update the 3x25's configuration settings.
@@ -287,23 +278,8 @@ class DDS(object):
         self._digital_output = digital_output
         self._clock_divider = clock_divider
 
-        b0 = 1 if self._counter_mode else 0
-        b0 |= 2 if reset_counter else 0
-        b0 |= 4 if self._oneshot else 0
-        b0 |= 8 if self._ext_trigger == 1 else 0
-        b0 |= 16 if self._ext_trigger is not None else 0
-        b0 |= 32 if reset_trigger else 0
-
-        b1 = 1 if self._programmable_output else 0
-
-        b2_3 = self._digital_output
-        b4_5 = self._clock_divider / 2
-
-        config_val = struct.pack('<B2BHH', DDS.CONFIGURE_PACKET_TYPE, b0, b1, b2_3, b4_5)
-
-        self._write(config_val)
-        response = self._read()
-
+        configure_packet = ConfigurePacket(self, reset_trigger=reset_trigger, reset_counter=reset_counter)
+        response = self.transfer(str(configure_packet))
         response = self._parse_configure_packet_response(response)
 
         return response
@@ -313,44 +289,100 @@ class DDS(object):
 
         return {
             'digital_input' : vals[0],
-            'frequency' : vals[1] * 2 if self._counter_mode is False else 0,
-            'ticks' : vals[2],
-            'counts' : vals[1] if self._counter_mode is True else 0,
+            'frequency' : vals[1] * 2 if self._counter_mode is False else None,
+            'ticks' : None if vals[2] == 0xffffffff else vals[2],
+            'counts' : vals[1] if self._counter_mode is True else None,
         }
 
-    def set_waveform(self, points, **kwargs):
+    def set_waveform(self, points, clock_divider=None):
         count = len(points)
         point_data = ''.join([ str(SamplePoint(point)) for point in points])
 
-        self._write(str(PointCountPacket(count, is_start=True)))
-        assert self._read()[0] == 0xcc
+        response = self.transfer(str(PointCountPacket(count, is_start=True)))
+        assert response[0] == 0xcc
 
         for chunk in samplepoint_chunks(point_data):
-            self._write(chunk)
-            assert self._read()[0] == 0xcc
+            response = self.transfer(chunk)
+            assert response[0] == 0xcc
 
-        self._write(str(PointCountPacket(count)))
-        assert self._read()[0] == 0xcc
+        response = self.transfer(str(PointCountPacket(count)))
+        assert response[0] == 0xcc
+
+        if clock_divider is not None:
+            self.configure(clock_divider=clock_divider)
 
     def reset_counter(self):
+        """Reset the 3x25 counter state."""
         self.configure(reset_counter=True)
 
     def reset_trigger(self):
+        """Reset the 3x25 external trigger."""
         self.configure(reset_trigger=True)
 
-    def digital_write(self, val):
+    def digital_write(self, pin, pin_state):
+        """Set the output state of a digital output pin.
+
+        Args:
+           pin (int): Number of pin to control.
+           pin_state (int/bool): If 1/True, pin will be set high.
+                             If 0/False, pin will be set low.
+        """
+        pin_state = 1 if pin_state else 0
+        digital_output = self._digital_output & ~(1 << pin)
+        digital_output |= (pin_state << pin)
+        self.configure(digital_output=digital_output)
+
+    def digital_write_port(self, pin_states):
+        """Set the output states of all digital output pins.
+
+        Args:
+           pin_states (int): Value comprised of bits to write to
+        the digital output pins.
+        """
         self.configure(digital_output=val)
 
-    def digital_read(self):
+    def digital_read(self, pin):
+        """Read the state of a digital input pin.
+
+        Args:
+           pin (int): Input pin # to read.
+
+        Returns:
+           0 if the pin is low, 1 if the pin is high.
+        """
+        digital_in = self.configure()['digital_input']
+        return 1 if (digital_in & (1 << pin)) else 0
+
+    def digital_read_port(self):
+        """Read the state of all input pins as one integer value.
+
+        Returns:
+           Integer w/bits set to the states of the input pins.
+        """
         return self.configure()['digital_input']
 
-    def frequency(self):
+    def count_in_frequency(self):
+        """Get the input frequency at the 3x25's COUNT IN port.
+
+        The frequency is only available when the 3x25 is NOT in counter mode.
+
+        Returns:
+           Frequency (in Hz) at the COUNT IN port, or None if in counter mode.
+        """
         return self.configure()['frequency']
 
-    def counts(self):
+    def count_in_counts(self):
+        """Get the # of pulses counted at the 3x25's COUNT IN port since last reset.
+
+        The count is only available when the 3x25 IS in counter mode.
+        use .reset_counter() to reset the value to 0.
+
+        Returns:
+           # of pulses counted at the COUNT IN port, or None if not in counter mode.
+        """
         return self.configure()['counts']
 
-    def ticks(self):
+    def count_in_ticks(self):
         return self.configure()['ticks']
 
     @property
@@ -391,36 +423,56 @@ class DDS(object):
 
     @staticmethod
     def points_and_div_for_freq(freq):
-        div = 1
-        while True:
-            npoints = (DDS.DAC_CLOCK + ((div * freq) / 2)) / (div * freq)
-            npoints = int(npoints)
-            if npoints <= DDS.MAX_POINTS:
-                break
-            div += 2 if div != 1 else 1
+        # Calculate divisor based on using max # of available samples possible.
+        # -- ceil( DAC_CLOCK / (frequency * MAX_POINTS) )
+        freq = int(freq)
+        div = (DDS.DAC_CLOCK + (freq - 1) * DDS.MAX_POINTS) / (freq * DDS.MAX_POINTS)
 
-        return (npoints, div)
+        # Adjust if odd value -- divisor has to be 1 or a multiple of 2
+        if div > 1 and div & 1:
+            div += 1
 
-    def generate_sine(self, freq, amplitude=(1<<11)-1, offset=0):
-        (npoints, div) = DDS.points_and_div_for_freq(freq)
+        # Calculate # of sample points to use w/this divider to get closest
+        # to requested frequency
+        # -- round( DAC_CLOCK / (divider * frequency) )
+        npoints = (DDS.DAC_CLOCK + (div * freq / 2)) / (div * freq)
+
+        # Calculate actual frequency
+        actual = (DDS.DAC_CLOCK / div) / npoints
+
+        return (npoints, div, actual)
+
+    def generate_sine(self, freq, amplitude=(1<<11)-1, offset=0, phase=0.0, shift=0):
+        phase = float(phase)
+        npoints, div, actual = DDS.points_and_div_for_freq(freq)
         points = []
         for i in range(npoints):
             i = float(i)
-            point = (amplitude * math.sin(2.0 * math.pi * i / npoints)) + offset
+            point = (amplitude * math.sin((2.0 * math.pi * i / npoints) + phase)) + offset
             points.append(int(point))
 
-        self.configure(clock_divider=div)
-        self.set_waveform(points)
+        if shift:
+            points = collections.deque(points)
+            points.rotate(shift)
 
-    def generate_square(self, freq, duty_cycle=0.5, amplitude=(1<<11)-1, offset=0):
-        (npoints, div) = DDS.points_and_div_for_freq(freq)
+        self.set_waveform(points, clock_divider=div)
+        return actual
+
+    def generate_square(self, freq, duty_cycle=0.5, amplitude=(1<<11)-1, offset=0, phase=0.0, shift=0):
+        phase = float(phase)
+        npoints, div, actual = DDS.points_and_div_for_freq(freq)
         points = []
         for i in range(npoints):
-            point = -amplitude if i >= (duty_cycle * npoints) else amplitude
+            shifted = int(i + (phase * npoints) / (2.0 * math.pi)) % npoints
+            point = amplitude if shifted < (duty_cycle * npoints) else -amplitude
             points.append(int(point + offset))
 
-        self.configure(clock_divider=div)
-        self.set_waveform(points)
+        if shift:
+            points = collections.deque(points)
+            points.rotate(shift)
+
+        self.set_waveform(points, clock_divider=div)
+        return actual
 
 
 if __name__ == "__main__":
